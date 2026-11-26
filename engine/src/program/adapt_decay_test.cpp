@@ -7,8 +7,18 @@
 #include <initializer_list>
 #include <limits>
 
+using strata::program::AdaptPolicy;
 using strata::program::adapt_decay_checked;
+using strata::program::adapt_policy_parse;
 using strata::program::kAdaptDecayDefault;
+using strata::program::kPewmaGammaDefault;
+using strata::program::kPewmaImpulseAuto;
+using strata::program::kPewmaInitDefault;
+using strata::program::kPewmaTauDefault;
+using strata::program::pewma_gamma_checked;
+using strata::program::pewma_impulse_checked;
+using strata::program::pewma_init_checked;
+using strata::program::pewma_tau_checked;
 
 namespace {
 int checks = 0;
@@ -44,6 +54,21 @@ int main() {
     const float d = adapt_decay_checked(1.5, nullptr);
     for (int i = 0; i < 100000; ++i) usage = usage * d + 1.f;
     check(std::isfinite(usage), "counts stay finite with the value the engine ends up using");
+
+    // PEWMA parameter validators
+    check(adapt_policy_parse("linear", nullptr) == AdaptPolicy::Linear, "linear parses");
+    check(adapt_policy_parse("pewma", nullptr) == AdaptPolicy::Pewma, "pewma parses");
+    check(adapt_policy_parse("bogus", nullptr) == AdaptPolicy::Linear, "unknown policy falls back to linear");
+    check(pewma_gamma_checked(0.7, nullptr) == 0.7f, "valid gamma kept");
+    check(pewma_gamma_checked(0.0, nullptr) == kPewmaGammaDefault, "gamma 0 falls back");
+    check(pewma_gamma_checked(1.2, nullptr) == kPewmaGammaDefault, "gamma > 1 falls back");
+    check(pewma_tau_checked(0.0, nullptr) == 0.0f, "tau 0 allowed (discrete mode)");
+    check(pewma_tau_checked(-1.0, nullptr) == kPewmaTauDefault, "negative tau falls back");
+    check(pewma_init_checked(0.5, nullptr) == 0.5f, "valid init kept");
+    check(pewma_init_checked(-0.1, nullptr) == kPewmaInitDefault, "negative init falls back");
+    check(pewma_impulse_checked(0.0, nullptr) == kPewmaImpulseAuto, "impulse 0 (auto) allowed");
+    check(pewma_impulse_checked(-2.0, nullptr) == kPewmaImpulseAuto, "negative impulse falls back");
+
     std::printf("adapt_decay_test: %d checks passed\n", checks);
     return 0;
 }

@@ -693,6 +693,11 @@ struct Options {
     /// the VRAM tier in place of the least-routed resident ones (decayed counts).  0 = static residency.
     int adapt_every = 4;
     float adapt_decay = 0.7f;   ///< the usage counts are multiplied by this after each adaptation (--adapt-decay)
+    strata::program::AdaptPolicy adapt_policy = strata::program::AdaptPolicy::Linear;
+    float pewma_gamma = strata::program::kPewmaGammaDefault;
+    float pewma_tau = strata::program::kPewmaTauDefault;
+    float pewma_init = strata::program::kPewmaInitDefault;
+    float pewma_impulse = strata::program::kPewmaImpulseAuto;
     /// --adapt-async 1 (--serve with the resident RAM mode; opt-in): the adaptive tier's rounds advance between verify
     /// windows on a helper thread instead of one window waiting for a whole round (see the tier in the --serve block).
     /// Not bit-exact run to run.  0 = the blocking tier.
@@ -2051,6 +2056,11 @@ int main(int argc, char **argv) try {
         else if (a == "--pcie-frac") o.pcie_frac = std::atof(next("--pcie-frac"));
         else if (a == "--adapt-every") o.adapt_every = std::atoi(next("--adapt-every"));
         else if (a == "--adapt-decay") o.adapt_decay = strata::program::adapt_decay_checked(std::atof(next("--adapt-decay")));   // #1284: outside 0..1 -> 0.7, said
+        else if (a == "--adapt-policy") o.adapt_policy = strata::program::adapt_policy_parse(next("--adapt-policy"));
+        else if (a == "--pewma-gamma") o.pewma_gamma = strata::program::pewma_gamma_checked(std::atof(next("--pewma-gamma")));
+        else if (a == "--pewma-tau") o.pewma_tau = strata::program::pewma_tau_checked(std::atof(next("--pewma-tau")));
+        else if (a == "--pewma-init") o.pewma_init = strata::program::pewma_init_checked(std::atof(next("--pewma-init")));
+        else if (a == "--pewma-impulse") o.pewma_impulse = strata::program::pewma_impulse_checked(std::atof(next("--pewma-impulse")));
         else if (a == "--adapt-async") o.adapt_async = std::atoi(next("--adapt-async")) != 0 ? 1 : 0;
         else if (a == "--spec-min-p") o.spec_min_p = std::atof(next("--spec-min-p"));
         else if (a == "--stop-eos") o.stop_eos = true;
@@ -5784,6 +5794,11 @@ int main(int argc, char **argv) try {
     drive.d.pool = &pool;
     drive.d.src = srcp;
     drive.d.n_expert = g.n_expert;
+    drive.d.adapt_policy = o.adapt_policy;
+    drive.d.pewma_gamma = o.pewma_gamma;
+    drive.d.pewma_tau = o.pewma_tau;
+    drive.d.pewma_init = o.pewma_init;
+    drive.d.pewma_impulse = o.pewma_impulse;
     drive.d.jobs.resize((size_t) K);
     // CS-T: routing-aware prefetch of the file tier (the GGUF in place): the next layer's router on this layer's MoE
     // input predicts its experts and their pages are warmed meanwhile.  It only warms pages; STRATA_LOOKAHEAD=0 is
@@ -8733,7 +8748,7 @@ int main(int argc, char **argv) try {
             std::fprintf(stderr, "strata generate: every expert is on a GPU (primary + helper/peer caches); "
                                  "adaptive tier off\n");
         if (o.adapt_every > 0 && o.adapt_swaps > 0 && !all_experts_on_gpus)
-            drive.d.usage.assign((size_t) (g.n_layers * g.n_expert), 0.0f);
+            strata::program::init_usage(drive.d, (size_t) (g.n_layers * g.n_expert));
         PcieAuto pcie_auto;
         if (o.pcie_frac_auto && !all_experts_resident && o.batch == 0 && n_stages == 1) {
             const auto& pl = strata::kernels::cpu::expert_layout();
@@ -8842,10 +8857,7 @@ int main(int argc, char **argv) try {
         // #6560: request thread owns drive.d.usage exclusively (no race with expert_pool_dispatch_multi's += 1.0f
         // under --pipeline-windows 2); snapshot + heat + decay run on the request thread before spawning adapt().
         auto snapshot_usage = [&]() -> std::vector<float> {
-            std::vector<float> snap = drive.d.usage;
-            for (size_t i = 0; i < heat.size(); ++i) heat[i] += (double) snap[i];
-            for (float& v : drive.d.usage) v *= o.adapt_decay;
-            return snap;
+            return strata::program::snapshot_and_decay_usage(drive.d, heat, o.adapt_decay);
         };
         // the VRAM tier follows the conversation (the same rule as the speculative loop below)
         auto adapt = [&](const std::vector<float>& usage_snap) -> bool {
@@ -9284,11 +9296,8 @@ int main(int argc, char **argv) try {
                     a_last = a_win;
                     ++a_rounds;
                     a_t0 = Clock::now();
-                    a_usage = drive.d.usage;
+                    a_usage = strata::program::snapshot_and_decay_usage(drive.d, heat, o.adapt_decay);
                     a_res = host_res;
-                    // #477: the routing counted, as adapt() counts it (--expert-profile-save; else `heat` is empty)
-                    for (size_t i = 0; i < heat.size(); ++i) heat[i] += (double) drive.d.usage[i];
-                    for (float& v : drive.d.usage) v *= o.adapt_decay;
                     ajob->post(a_choose);
                     astate = AState::CopyBack;
                     return true;
@@ -13797,7 +13806,7 @@ int main(int argc, char **argv) try {
         const int64_t files0 = src.file_reads(), ram0 = src.ram_reads();
         const uint64_t fbytes0 = src.file_blob_bytes(), fall0 = src.file_read_bytes();
         const double fms0 = src.file_ms();
-        if (o.adapt_every > 0 && o.adapt_swaps > 0) drive.d.usage.assign((size_t) (g.n_layers * g.n_expert), 0.0f);
+        if (o.adapt_every > 0 && o.adapt_swaps > 0) strata::program::init_usage(drive.d, (size_t) (g.n_layers * g.n_expert));
         int64_t swaps_total = 0;
         double ms_adapt = 0;
         dpct::queue_ptr adapt_stream = &dpct::get_in_order_queue();
@@ -14183,8 +14192,8 @@ int main(int argc, char **argv) try {
             std::thread adapt_thr;
             bool adapt_ok = true;
             if (!drive.d.usage.empty() && pending.empty() && ((rounds + 1) % o.adapt_every) == 0) {
-                std::vector<float> usnap = drive.d.usage;
-                for (float& v : drive.d.usage) v *= o.adapt_decay;
+                std::vector<double> no_heat;
+                std::vector<float> usnap = strata::program::snapshot_and_decay_usage(drive.d, no_heat, o.adapt_decay);
                 adapt_thr = std::thread([&, u = std::move(usnap)] { adapt_ok = adapt(u); });
             }
             if (!ver.commit(a + 1, err)) {

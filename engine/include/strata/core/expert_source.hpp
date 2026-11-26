@@ -26,6 +26,7 @@
 #include "strata/core/exchange_storage.hpp"
 #include "strata/core/hit_hook.hpp"
 #include "strata/kernels/cpu/pool.hpp"
+#include "strata/program/adapt_decay.hpp"
 
 #include <algorithm>
 #include <array>
@@ -666,6 +667,13 @@ struct ExpertDispatch {
     /// Plan v0.3 P6: decayed routing counts per (layer, expert) during decode (sized by the caller; empty = off),
     /// which the driver uses to swap the most-routed missing experts into the VRAM tier between rounds.
     std::vector<float> usage;
+    strata::program::AdaptPolicy adapt_policy = strata::program::AdaptPolicy::Linear;
+    float pewma_gamma = strata::program::kPewmaGammaDefault;
+    float pewma_tau = strata::program::kPewmaTauDefault;
+    float pewma_init = strata::program::kPewmaInitDefault;
+    float pewma_impulse = strata::program::kPewmaImpulseAuto;
+    int64_t usage_clock = 0;
+    std::vector<int64_t> usage_last_tok;   ///< allocated only when adapt_policy == Pewma && pewma_tau > 0
     /// The adaptive tier's evictions reach the device's table before the next window, not when the round's copies
     /// land: until then doorbell_publish_res can skip a layer's activation while the pool computes an evicted expert
     /// from the one published before.  The driver sets it where the tier does not wait for its copies
